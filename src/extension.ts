@@ -151,7 +151,30 @@ export function activate(context: vscode.ExtensionContext) {
             console.log('EXIT prepareEditorForWrite (no workspace folder)');
             return;
         }
-        const targetUri = vscode.Uri.joinPath(wsFolder.uri, relPath);
+        // Normalize incoming path: support relative paths, absolute paths that include the workspace path,
+        // and full vscode-remote/file URIs passed from the agent.
+        let targetUri: vscode.Uri;
+        try {
+            if (relPath.startsWith('vscode-') || relPath.startsWith('vscode:') || relPath.startsWith('file:') || relPath.startsWith('http')) {
+                targetUri = vscode.Uri.parse(relPath);
+            } else {
+                const wsPath = wsFolder.uri.path || '';
+                let normalized = relPath;
+                if (normalized.startsWith(wsPath)) {
+                    normalized = normalized.slice(wsPath.length);
+                }
+                normalized = normalized.replace(/^\/+/, '');
+                targetUri = vscode.Uri.joinPath(wsFolder.uri, normalized);
+            }
+        } catch (e) {
+            console.error('Could not resolve targetUri for write:', e);
+            out.appendLine(`Could not resolve targetUri for write: ${String(e)}`);
+            out.appendLine('EXIT prepareEditorForWrite (resolve error)');
+            console.log('EXIT prepareEditorForWrite (resolve error)');
+            return;
+        }
+        out.appendLine(`Resolved targetUri: ${targetUri.toString()}`);
+        console.log(`Resolved targetUri: ${targetUri.toString()}`);
 
         // 1. 准备 Diff 左侧 (Snapshot)
         let originalContent = "";
