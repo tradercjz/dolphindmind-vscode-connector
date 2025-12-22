@@ -1,0 +1,43 @@
+{
+  "name": "dolphinmind-vscode",
+  "displayName": "DolphinMind Vscode Connector",
+  "publisher": "DolphinMind",
+  "author": {
+    "name": "Jinzhi Chen",
+    "email": "jinzhi.chen@dolphindb.com",
+    "url": "https://chat.dolphindb.cloud"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tradercjz/"
+  },
+  "license": "MIT",
+  "version": "0.0.3",
+  "engines": { "vscode": "^1.80.0" },
+  "activationEvents": [
+    "onStartupFinished" 
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "dolphinmind-vscode.connect",
+        "title": "Reconnect to Vscode"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/ws": "^8.5.10",
+    "@types/node": "^18.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
