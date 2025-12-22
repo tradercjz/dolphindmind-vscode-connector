@@ -16,7 +16,7 @@ DolphinMind Vscode Connector 是一个 Visual Studio Code 扩展，旨在将 VS 
 ## 🚀 快速开始
 
 ### 1. 安装
-通常作为 DolphinMind 解决方案的一部分安装，或通过 `.vsix` 文件手动安装。
+通常作为 DolphinMind 解决方案的一部分,在chat.dolphindb.cloud 的Coding模式下，会自动安装。
 
 ### 2. 配置与连接
 扩展在 VS Code 启动时 (`onStartupFinished`) 会自动尝试连接到 Agent 服务器。
