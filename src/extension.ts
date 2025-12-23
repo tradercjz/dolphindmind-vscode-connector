@@ -5,14 +5,23 @@ import WebSocket from 'ws';
 interface EditorCommandMsg {
     type: 'EDITOR_COMMAND';
     nonce?: string;
-    command: 'WRITE_FILE' | 'APPLY_PATCH';
+    command: 'WRITE_FILE' | 'APPLY_PATCH'| 'OPEN_FILE' | 'SHOW_MODIFICATION';
     payload: {
         filePath: string;
         content?: string; // 用于 WRITE_FILE
         diff?: string;    // 用于 APPLY_PATCH
         mode?: 'overwrite' | 'diff';
+        anchor?: string; // 用于定位的文本片段
+        type?: 'overwrite' | 'patch';
     };
 }
+
+const modificationDec = vscode.window.createTextEditorDecorationType({
+    backgroundColor: 'rgba(50, 205, 50, 0.3)', // 亮绿色背景
+    isWholeLine: true,
+    overviewRulerColor: 'green',
+    overviewRulerLane: vscode.OverviewRulerLane.Right
+});
 
 // 定义 Patch 结构
 interface CodePatch {
@@ -43,6 +52,68 @@ const insertDec = vscode.window.createTextEditorDecorationType({
 class ContentProvider implements vscode.TextDocumentContentProvider {
     provideTextDocumentContent(uri: vscode.Uri): string {
         return originalContentMap.get(uri.path) || "";
+    }
+}
+
+/**
+ * 辅助函数：打开并显示文件
+ * 兼容处理相对路径、绝对路径和完整 URI
+ */
+async function openFileInEditor(filePath: string): Promise<vscode.TextEditor | undefined> {
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!wsFolder) {
+        vscode.window.showErrorMessage('无法打开文件：当前没有打开的工作区。');
+        return undefined;
+    }
+
+    let targetUri: vscode.Uri;
+
+    try {
+        // 1. 路径解析策略
+        // 如果包含协议头 (如 vscode-remote://, file://, http://)，直接解析为 URI
+        if (filePath.includes('://') || filePath.startsWith('file:') || filePath.startsWith('vscode-')) {
+            targetUri = vscode.Uri.parse(filePath);
+        } 
+        else {
+            // 处理相对路径/绝对路径
+            // 移除开头的斜杠或反斜杠，确保 joinPath 正确工作
+            let cleanPath = filePath.replace(/^[\\\/]+/, '');
+            
+            // 可选：如果你的后端返回的路径包含工作区根目录名（例如 /workspace/src/main.py），
+            // 而 VSCode 打开的根目录就是 /workspace，你可能需要在这里切片。
+            // const wsPathName = wsFolder.name; // e.g. "workspace"
+            // if (cleanPath.startsWith(wsPathName + '/')) {
+            //     cleanPath = cleanPath.slice(wsPathName.length + 1);
+            // }
+
+            targetUri = vscode.Uri.joinPath(wsFolder.uri, cleanPath);
+        }
+
+        // 2. 尝试打开文档
+        // openTextDocument 会加载文档对象 (TextDocument)
+        const doc = await vscode.workspace.openTextDocument(targetUri);
+
+        // 3. 在编辑器中显示
+        // viewColumn: Active 表示在当前活动列打开
+        // preview: false 表示不要以“预览模式”（斜体标题）打开，防止点击其他文件时被关闭
+        const editor = await vscode.window.showTextDocument(doc, {
+            viewColumn: vscode.ViewColumn.Active,
+            preview: false 
+        });
+
+        return editor;
+
+    } catch (e) {
+        console.error(`[Open File Error] Path: ${filePath}`, e);
+        
+        // 尝试友好的错误提示
+        if ((e as any)?.code === 'FileNotFound') {
+            vscode.window.showErrorMessage(`无法打开文件：找不到文件 ${filePath}`);
+        } else {
+            vscode.window.showErrorMessage(`打开文件失败: ${e}`);
+        }
+        
+        return undefined;
     }
 }
 
@@ -109,6 +180,20 @@ export function activate(context: vscode.ExtensionContext) {
                 console.log('handleMessage: APPLY_PATCH');
                 resetQueue(); // Patch 不走流式队列，走原子动画
                 await handleApplyPatch(payload.filePath, payload.diff || "");
+            } else if (command === 'OPEN_FILE') {
+                out.appendLine('handleMessage: OPEN_FILE');
+                
+                // 1. 立即 ACK (因为只是打开文件，很快)
+                sendAck();
+                
+                // 2. 打开文件
+                await openAndShowFile(payload.filePath);
+            } else if (msg.command === 'SHOW_MODIFICATION') {
+                await showModificationEffect(
+                    msg.payload.filePath, 
+                    msg.payload.anchor || "", 
+                    msg.payload.type!
+                );
             }
 
             out.appendLine('EXIT handleMessage');
@@ -118,7 +203,83 @@ export function activate(context: vscode.ExtensionContext) {
             out.appendLine(`Error handling message: ${String(e)}`);
             vscode.window.showErrorMessage(`Agent Error: ${e}`);
             out.appendLine('EXIT handleMessage (error)');
-            console.log('EXIT handleMessage (error)');
+            console.log('EXIT ha ndleMessage (error)');
+        }
+    }
+
+    // 核心视觉效果函数
+    async function showModificationEffect(relPath: string, anchor: string, type: 'overwrite' | 'patch') {
+        // 1. 打开并显示文件 (复用之前的路径解析逻辑)
+        const editor = await openFileInEditor(relPath); 
+        if (!editor) return;
+
+        const doc = editor.document;
+        let rangeToHighlight: vscode.Range;
+
+        // 2. 确定高亮范围
+        if (type === 'overwrite' || !anchor) {
+            // 全量覆盖：高亮前 20 行，或者全文
+            rangeToHighlight = new vscode.Range(0, 0, Math.min(doc.lineCount, 20), 0);
+        } else {
+            // Patch 修改：在文档中搜索锚点文本
+            const text = doc.getText();
+            // 简单的字符串查找，定位到 Agent 修改的地方
+            const idx = text.indexOf(anchor);
+            if (idx !== -1) {
+                const startPos = doc.positionAt(idx);
+                const endPos = doc.positionAt(idx + anchor.length);
+                // 扩展一下高亮范围，让视觉更明显
+                rangeToHighlight = new vscode.Range(startPos, endPos);
+            } else {
+                // 找不到锚点（可能格式化变了），回退到高亮文件末尾或开头
+                rangeToHighlight = new vscode.Range(doc.lineCount - 5, 0, doc.lineCount, 0);
+            }
+        }
+
+        // 3. 滚动并高亮
+        editor.revealRange(rangeToHighlight, vscode.TextEditorRevealType.InCenter);
+        
+        // 应用高亮
+        editor.setDecorations(modificationDec, [rangeToHighlight]);
+
+        // 4. 2秒后淡出/移除高亮
+        setTimeout(() => {
+            editor.setDecorations(modificationDec, []);
+        }, 2000);
+        
+        // 可选：状态栏提示
+        vscode.window.setStatusBarMessage(`$(sparkle) Agent updated: ${relPath}`, 4000);
+    }
+
+    async function openAndShowFile(relPath: string) {
+        const wsFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!wsFolder) return;
+
+        // 路径解析逻辑 (复用之前的)
+        let targetUri: vscode.Uri;
+        try {
+             if (relPath.startsWith('vscode-') || relPath.startsWith('vscode:') || relPath.startsWith('file:') || relPath.startsWith('http')) {
+                targetUri = vscode.Uri.parse(relPath);
+            } else {
+                const wsPath = wsFolder.uri.path || '';
+                let normalized = relPath;
+                if (normalized.startsWith(wsPath)) {
+                    normalized = normalized.slice(wsPath.length);
+                }
+                normalized = normalized.replace(/^\/+/, '');
+                targetUri = vscode.Uri.joinPath(wsFolder.uri, normalized);
+            }
+        } catch(e) { return; }
+
+        // 打开文档
+        try {
+            const doc = await vscode.workspace.openTextDocument(targetUri);
+            await vscode.window.showTextDocument(doc);
+            
+            // 可选：给个提示
+            vscode.window.setStatusBarMessage(`$(check) File updated by Agent: ${relPath}`, 3000);
+        } catch (e) {
+            console.error("Failed to open file:", e);
         }
     }
 
@@ -176,20 +337,22 @@ export function activate(context: vscode.ExtensionContext) {
         out.appendLine(`Resolved targetUri: ${targetUri.toString()}`);
         console.log(`Resolved targetUri: ${targetUri.toString()}`);
 
-        // 1. 准备 Diff 左侧 (Snapshot)
-        let originalContent = "";
-        try {
-            const bytes = await vscode.workspace.fs.readFile(targetUri);
-            originalContent = new TextDecoder().decode(bytes);
-        } catch { /* new file */ }
-        originalContentMap.set(targetUri.path, originalContent);
-
-        // 2. 准备 Diff 右侧 (清空)
-        const leftUri = vscode.Uri.parse(`${SCHEME}:${targetUri.path}`);
+        // 1. 准备文件 (创建或覆盖)
+        // 这一步确保文件存在
         const wsEdit = new vscode.WorkspaceEdit();
         wsEdit.createFile(targetUri, { overwrite: true, ignoreIfExists: true });
         await vscode.workspace.applyEdit(wsEdit);
 
+        // 2. 打开编辑器
+        // 准备 Diff 视图所需的左侧 URI
+        const leftUri = vscode.Uri.parse(`${SCHEME}:${targetUri.path}`);
+        // 填充左侧 Provider 的内容 (Snapshot)
+        try {
+            const bytes = await vscode.workspace.fs.readFile(targetUri);
+            originalContentMap.set(targetUri.path, new TextDecoder().decode(bytes));
+        } catch { 
+            originalContentMap.set(targetUri.path, ""); 
+        }
         // 3. 打开视图
         await vscode.commands.executeCommand('vscode.diff', leftUri, targetUri, `AI Editing: ${relPath}`);
         
@@ -200,19 +363,34 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
 
-        // 4. 清空当前内容
-        await activeEditor.edit(b => {
-            const lastLine = activeEditor!.document.lineCount;
-            b.delete(new vscode.Range(0, 0, lastLine, 0));
+        // 3.直接全量替换内容，不搞花里胡哨的动画
+        const doc = activeEditor.document;
+        const fullRange = new vscode.Range(0, 0, doc.lineCount, 0);
+        
+        const success = await activeEditor.edit(editBuilder => {
+            // 先清空，再写入。这种原子操作非常快 (毫秒级)
+            editBuilder.replace(fullRange, fullContent);
         });
 
-        // 5. 将后端传来的 Full Content 拆分为行，放入队列开始动画
-        lineQueue = fullContent.split('\n').map(line => line + '\n'); // 补回换行符
-        isAiFinished = true; // 因为是一次性传来的，所以直接标记结束
-        currentLineIndex = 0;
+        if (success) {
+            // 4. 视觉反馈：给全文或前 50 行加上绿色高亮，提示用户这是新生成的
+            const highlightRange = new vscode.Range(0, 0, Math.min(doc.lineCount, 50), 0);
+            activeEditor.setDecorations(insertDec, [highlightRange]);
+            
+            // 1.5秒后淡出高亮
+            setTimeout(() => {
+                activeEditor?.setDecorations(insertDec, []);
+            }, 1500);
+
+            // 5. 滚动到顶部
+            activeEditor.revealRange(new vscode.Range(0,0,0,0), vscode.TextEditorRevealType.AtTop);
+        }
+
+        // 6. 【关键】强制保存并发送 ACK
+        // 只有保存成功了，硬盘上才有数据，Agent 下一步读取才不会空
+        await finishLogic(); 
         
-        processQueue();
-        out.appendLine('EXIT prepareEditorForWrite');
+        out.appendLine('EXIT prepareEditorForWrite (Fast Mode)');
         console.log('EXIT prepareEditorForWrite');
     }
 
@@ -225,6 +403,9 @@ export function activate(context: vscode.ExtensionContext) {
             return; // 防止重入
         }
         isConsuming = true;
+
+        const BATCH_SIZE = 50; // 每次处理 50 行
+        let processedInBatch = 0;
 
         // 只要队列不为空，就一直处理
         while (lineQueue.length > 0) {
@@ -239,23 +420,22 @@ export function activate(context: vscode.ExtensionContext) {
                     b.insert(new vscode.Position(currentLineIndex, 0), chunk);
                 });
 
-                // 2. 动效 (高亮当前行)
-                // 滚动动效偶尔会打断用户，可以选择每隔几行滚动一次
-                const range = new vscode.Range(currentLineIndex, 0, currentLineIndex, 0);
-                activeEditor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-                activeEditor.setDecorations(activeLineDec, [range]);
-                
-                if (currentLineIndex > 0) {
-                    activeEditor.setDecorations(fadedDec, [new vscode.Range(0, 0, currentLineIndex - 1, 0)]);
+                // 2. 动效 (减少高亮频率，避免闪烁且提高性能)
+                // 只有在每个 Batch 结束时才滚动和高亮
+                currentLineIndex++;
+                processedInBatch++;
+
+                if (processedInBatch >= BATCH_SIZE || lineQueue.length === 0) {
+                    const range = new vscode.Range(currentLineIndex - 1, 0, currentLineIndex - 1, 0);
+                    activeEditor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                    activeEditor.setDecorations(activeLineDec, [range]);
+                    
+                    // 重置计数器并微小延时让 UI 刷新
+                    processedInBatch = 0;
+                    await new Promise(r => setTimeout(r, 5)); // 延迟降为 5ms 且每50行才触发一次
                 }
 
-                currentLineIndex++;
-
-                // 3. 微小延时 (控制打字机速度，太快了像直接粘贴，太慢了浪费时间)
-                // 使用 await 暂停，而不是阻塞线程
-                await new Promise(r => setTimeout(r, 20)); 
-
-                } catch (e) {
+            } catch (e) {
                 console.error("Render error:", e);
                 out.appendLine(`Render error: ${String(e)}`);
                 break;
